@@ -1,10 +1,10 @@
-# nixpacks.toml — Deployment configuration (Railway, Render, etc.)
+# nixpacks.toml — Railway deployment configuration
 #
-# ffmpeg is required again: it converts incoming OGG audio files from the
-# Telegram live-stream recorder into 192 kbps MP3 before Whisper transcription.
+# Uses aptPkgs (Debian apt) for ffmpeg — more reliable on Railway
+# than nixPkgs for binary system tools.
 
 [phases.setup]
-nixPkgs = ["python312", "ffmpeg"]
+aptPkgs = ["ffmpeg", "python3", "python3-pip"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
