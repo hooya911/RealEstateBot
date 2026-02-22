@@ -1,0 +1,13 @@
+# nixpacks.toml — Deployment configuration (Railway, Render, etc.)
+#
+# ffmpeg is required again: it converts incoming OGG audio files from the
+# Telegram live-stream recorder into 192 kbps MP3 before Whisper transcription.
+
+[phases.setup]
+nixPkgs = ["python312", "ffmpeg"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python bot.py"
