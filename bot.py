@@ -10,7 +10,7 @@ Forward TWO files (any order — simultaneously is fine):
 Pipeline (triggered when audio arrives):
   1. Download OGG → convert to 192 kbps MP3  (full quality, full length)
   2. Trim a 2-minute copy for analysis        (original MP3 unchanged)
-  3. Whisper transcribes the 2-min clip
+  3. Chirp 3 transcribes the 2-min clip       (Google Cloud Speech-to-Text)
   4. GPT-4o extracts: Property Address + MLS number
   5. Delete the 2-min clip
   6. Rename the full MP3 → "{Address}_MLS_{Number}.mp3"
@@ -19,7 +19,9 @@ Delivery (fires when both files are ready):
   7. Re-send video via Telegram file_id — caption = new filename
      (no download, works for any size)
   8. Send renamed MP3
-  9. Done — no reports, no summaries
+  9. Chirp 3 transcribes the full MP3         (55-sec ffmpeg chunks, no RAM limit)
+ 10. Send full transcription
+ 11. Gemini generates AI summary → send summary
 
 ─── STATE ───────────────────────────────────────────────────────────────────────
   _VIDEO_KEY       → file_id + type (stored, never downloaded)
@@ -28,6 +30,7 @@ Delivery (fires when both files are ready):
 """
 import os
 import html
+import asyncio
 import logging
 
 from telegram import Update, InputFile
@@ -40,8 +43,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, TEMP_DIR, TELEGRAM_MAX_FILE_MB
-from processor import convert_to_mp3, trim_audio_to_seconds, transcribe_audio
+from config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, TEMP_DIR, TELEGRAM_MAX_FILE_MB, GOOGLE_API_KEY
+from processor import convert_to_mp3, trim_audio_to_seconds, transcribe_audio, get_audio_duration_secs
 from analyzer import extract_address_and_mls, build_safe_filename
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -287,7 +290,78 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         _cleanup(raw_path, mp3_path, trimmed_path)
 
 
-# ── Package delivery — video + audio only, no reports ─────────────────────────
+# ── Transcription helpers (same pattern as telegram-audio-bot) ────────────────
+
+async def send_long_text(message, header: str, body: str) -> None:
+    """Send text to Telegram, splitting into multiple messages if > 4000 chars.
+    Header is HTML-formatted; body is sent with HTML-escaped content."""
+    LIMIT = 4000
+    full = header + html.escape(body)
+    if len(full) <= LIMIT:
+        await message.reply_text(full, parse_mode=ParseMode.HTML)
+        return
+
+    await message.reply_text(header, parse_mode=ParseMode.HTML)
+    remaining = body
+    part = 1
+    while remaining:
+        chunk = remaining[:LIMIT]
+        remaining = remaining[LIMIT:]
+        suffix = f"\n\n(part {part})" if remaining else ""
+        await message.reply_text(chunk + suffix)
+        part += 1
+
+
+async def summarize_with_gemini(transcription: str, duration_mins: float) -> str:
+    """Generate a real-estate walkthrough summary using Gemini (google-genai SDK)."""
+    from google import genai as google_genai
+
+    if not GOOGLE_API_KEY:
+        raise ValueError("GOOGLE_API_KEY is not set")
+
+    client = google_genai.Client(api_key=GOOGLE_API_KEY)
+
+    prompt = (
+        f"You are summarizing a {duration_mins:.1f}-minute real estate walkthrough recording "
+        f"transcribed from mixed Farsi and English speech.\n\n"
+        f"TRANSCRIPTION:\n{transcription}\n\n"
+        f"Write a detailed summary of the property walkthrough. Follow these rules:\n"
+        f"- Summarize in the same language(s) as the speaker — Farsi parts in Persian script (فارسی), English parts in English\n"
+        f"- Use clear sections/bullet points to organize the key topics\n"
+        f"- Cover all main points: property features, rooms, condition, highlights\n"
+        f"- Keep it concise but comprehensive\n"
+        f"- If mostly Farsi, write the summary mostly in Farsi; if mostly English, mostly English"
+    )
+
+    candidate_models = [
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash-001",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+    ]
+
+    loop = asyncio.get_running_loop()
+    last_error = None
+    for model_name in candidate_models:
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda m=model_name: client.models.generate_content(
+                    model=m,
+                    contents=prompt,
+                )
+            )
+            logger.info("Summary generated using model: %s", model_name)
+            return response.text.strip()
+        except Exception as e:
+            logger.warning("Model %s failed: %s", model_name, e)
+            last_error = e
+            continue
+
+    raise RuntimeError(f"All summary models failed. Last error: {last_error}")
+
+
+# ── Package delivery + full transcription + Gemini summary ────────────────────
 
 async def _deliver_package(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -299,12 +373,13 @@ async def _deliver_package(
 
     safe_name      = audio_info["safe_name"]
     audio_filename = audio_info["audio_filename"]
+    mp3_path       = audio_info["mp3_path"]
     video_filename = f"{safe_name}.mp4"
 
+    # ── 1. Deliver video + renamed MP3 ────────────────────────────────────────
     try:
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
 
-        # ── Send video via file_id — no download, any size ─────────────────────
         caption = (
             f"📹 <b>{_e(video_filename)}</b>\n"
             f"<code>{_e(safe_name)}</code>"
@@ -325,8 +400,7 @@ async def _deliver_package(
             )
         logger.info("Video re-sent via file_id: %s", video_filename)
 
-        # ── Send renamed MP3 ───────────────────────────────────────────────────
-        with open(audio_info["mp3_path"], "rb") as f:
+        with open(mp3_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=message.chat_id,
                 document=InputFile(f, filename=audio_filename),
@@ -336,8 +410,7 @@ async def _deliver_package(
 
         await message.reply_text(
             "✅ <b>Done!</b> Both files delivered.\n"
-            "<i>Forward the next pair whenever you're ready.</i>\n"
-            "Use /reset to start over.",
+            "<i>Now transcribing the full recording...</i>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -347,8 +420,53 @@ async def _deliver_package(
             f"❌ <b>Delivery error:</b> <code>{_e(type(exc).__name__)}: {_e(str(exc)[:300])}</code>",
             parse_mode=ParseMode.HTML,
         )
-    finally:
-        _cleanup(audio_info.get("mp3_path"))
+        _cleanup(mp3_path)
+        return
+
+    # ── 2. Full Chirp 3 transcription + Gemini summary ────────────────────────
+    if os.getenv("GOOGLE_CLOUD_CREDENTIALS") and os.path.exists(mp3_path):
+        duration_mins = get_audio_duration_secs(mp3_path) / 60
+
+        trans_status = await message.reply_text(
+            "🎙️ <b>Transcribing full audio with Chirp 3...</b>\n"
+            "⏳ This takes 1–3 min for longer recordings",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            transcription = await transcribe_audio(mp3_path)
+            await trans_status.delete()
+
+            header = f"📝 <b>Transcription</b> — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
+            await send_long_text(message, header, transcription)
+            logger.info("Transcription sent for %s", safe_name)
+
+            # ── Gemini summary ─────────────────────────────────────────────────
+            if GOOGLE_API_KEY:
+                sum_status = await message.reply_text(
+                    "🤖 <b>Generating AI summary with Gemini...</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+                try:
+                    summary = await summarize_with_gemini(transcription, duration_mins)
+                    await sum_status.delete()
+                    header = f"📋 <b>Summary</b> — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
+                    await send_long_text(message, header, summary)
+                    logger.info("Summary sent for %s", safe_name)
+                except Exception as sum_err:
+                    await sum_status.edit_text(
+                        f"⚠️ Summary failed: {_e(str(sum_err)[:200])}\n"
+                        "✅ Transcription was still sent above."
+                    )
+                    logger.error("Summary error: %s", sum_err, exc_info=True)
+
+        except Exception as trans_err:
+            await trans_status.edit_text(
+                f"❌ Transcription failed: {_e(str(trans_err)[:200])}\n"
+                "✅ Files were still delivered above."
+            )
+            logger.error("Transcription error: %s", trans_err, exc_info=True)
+
+    _cleanup(mp3_path)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
