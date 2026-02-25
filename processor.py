@@ -22,7 +22,7 @@ from config import GOOGLE_CLOUD_CREDENTIALS
 logger = logging.getLogger(__name__)
 
 
-def _get_audio_duration_secs(path: str) -> float:
+def get_audio_duration_secs(path: str) -> float:
     """Return audio duration in seconds using ffprobe (no file load into RAM)."""
     # Try stream-level duration first
     probe = subprocess.run(
@@ -192,7 +192,7 @@ async def transcribe_audio(audio_path: str) -> str:
     )
     recognizer_path = f"projects/{project_id}/locations/us/recognizers/_"
 
-    duration_secs = _get_audio_duration_secs(audio_path)
+    duration_secs = get_audio_duration_secs(audio_path)
     CHUNK_SECS = 55
     num_chunks = max(1, math.ceil(duration_secs / CHUNK_SECS))
     logger.info("Audio: %.1fs — %d chunk(s) for Chirp 3", duration_secs, num_chunks)
