@@ -1,12 +1,14 @@
 # Real Estate Walkthrough Bot — Python dependencies
 #
 # System dependency (NOT pip-installable — install separately):
-#   ffmpeg  →  OGG → 192kbps MP3 conversion before Whisper transcription
+#   ffmpeg  →  OGG → 192kbps MP3 conversion + Chirp 3 chunk extraction
 #   Local:   https://ffmpeg.org/download.html
 #   Railway: handled automatically via nixpacks.toml
 
 python-telegram-bot>=21.0
 openai>=1.0.0
 google-genai>=0.8.0
+google-cloud-speech>=2.0.0
+google-auth>=2.0.0
 python-dotenv>=1.0.1
 httpx>=0.27.0
