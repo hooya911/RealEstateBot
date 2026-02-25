@@ -221,7 +221,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text(
             "📝 <b>Transcribing first 2 minutes...</b>", parse_mode=ParseMode.HTML
         )
-        transcript = transcribe_audio(trimmed_path)
+        transcript = await transcribe_audio(trimmed_path)
         _cleanup(trimmed_path)
         trimmed_path = None
 
