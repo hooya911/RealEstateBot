@@ -18,6 +18,7 @@ Public API:
   sanitize_for_filename(address)        → safe filename stem
 """
 import re
+import html as _html
 import logging
 import httpx
 from google import genai
@@ -119,6 +120,89 @@ def _format_listing_data(results: list[dict], label: str = "") -> str:
             lines.append("")
 
     return "\n".join(lines).strip()
+
+
+# ── Listing page fetcher ───────────────────────────────────────────────────────
+
+# Canadian real estate listing domains — pages from these are worth fetching
+_LISTING_DOMAINS = {
+    "realtor.ca", "housesigma.com", "zolo.ca", "rew.ca",
+    "remax.ca", "royallepage.ca", "century21.ca", "coldwellbanker.ca",
+    "sutton.com", "point2homes.com", "zoocasa.com", "condos.ca",
+    "kijiji.ca", "propertyguys.com", "exp.com", "sothebysrealty.com",
+}
+
+# Browser-like headers so listing sites don't block the request
+_PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.9",
+    "Accept-Language": "en-CA,en;q=0.9",
+}
+
+
+def _is_likely_listing_page(url: str) -> bool:
+    """Return True if the URL looks like a real estate listing detail page."""
+    for domain in _LISTING_DOMAINS:
+        if domain in url:
+            return True
+    # Generic URL patterns used by broker sites
+    return bool(re.search(
+        r"/(listing|property|mls|real-estate|house|home|condo|property-detail)/",
+        url, re.IGNORECASE,
+    ))
+
+
+def _strip_html(html_text: str) -> str:
+    """
+    Remove HTML tags, scripts, and styles; decode entities; collapse whitespace.
+    Returns clean, readable text.
+    """
+    # Drop <script> and <style> blocks entirely
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html_text,
+                  flags=re.DOTALL | re.IGNORECASE)
+    # Drop HTML comments
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    # Replace block-level tags with newlines for readability
+    text = re.sub(r"<(?:br|p|div|li|h[1-6]|tr|td|th)[^>]*>", "\n", text,
+                  flags=re.IGNORECASE)
+    # Strip remaining tags
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Decode HTML entities (&amp; → & etc.)
+    text = _html.unescape(text)
+    # Collapse repeated whitespace / blank lines
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _fetch_page_text(url: str, max_chars: int = 8000) -> str:
+    """
+    Fetch a real estate listing page and return its stripped text content.
+
+    Limits output to max_chars so we don't flood the AI context.
+    Returns "" on any network/parse error.
+    """
+    try:
+        with httpx.Client(timeout=15, follow_redirects=True,
+                          headers=_PAGE_HEADERS) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            ctype = resp.headers.get("content-type", "")
+            if "html" not in ctype:
+                logger.info("Skipping non-HTML page: %s (%s)", url[:80], ctype)
+                return ""
+            text = _strip_html(resp.text)
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n[... page truncated ...]"
+            logger.info("Fetched listing page %s — %d chars", url[:80], len(text))
+            return text
+    except Exception as exc:
+        logger.warning("Could not fetch listing page %s: %s", url[:80], exc)
+        return ""
 
 
 # ── Address extraction (GPT-4o primary, Gemini fallback) ───────────────────────
@@ -237,31 +321,34 @@ def find_property_address(mls_number: str) -> str:
 
 def fetch_listing_data(address: str | None, mls: str | None) -> str:
     """
-    Fetch property listing details (beds, baths, sqft, price, parking, etc.)
-    from Brave Search using the address and MLS number we already know.
+    Fetch comprehensive property listing details from Brave Search.
 
-    Unlike find_property_address_with_data() this skips Pass 1 (MLS→address)
-    because the address was already extracted from the audio transcript.
+    TWO-LAYER approach:
+      Layer 1 — Brave snippets:
+        Quick titles + short descriptions from the top search results.
+        Usually contains: beds, baths, price, sqft at a glance.
 
-    Strategy:
-      - address + MLS  → address+MLS combined search (most precise)
-      - address only   → address listing search
-      - MLS only       → MLS listing search
-      - neither        → returns empty string
+      Layer 2 — Full page fetch:
+        Visits the top 1-2 listing pages (realtor.ca, housesigma, zolo, etc.)
+        and extracts the full visible text, which typically includes:
+          • Size (sq ft), Lot Size, Basement type, Days on Market, Tax
+          • Complete broker/marketing description (bullet points, features)
+          • Parking, heating, garage, school zones, etc.
 
-    Returns:
-        Formatted listing data text ready for AI consumption, or "" if nothing found.
+    The combined output gives Gemini everything it needs to write a rich
+    Property Specs block at the top of the summary.
+
+    Returns "" if BRAVE_API_KEY is not set or nothing is found.
     """
     if not BRAVE_API_KEY:
         logger.warning("BRAVE_API_KEY not set — skipping property detail lookup.")
         return ""
 
+    # ── Layer 1: Brave Search snippets ────────────────────────────────────────
     results: list[dict] = []
-
     if address and mls:
         results = _brave_search_by_address(address, mls)
         if not results:
-            # Fallback: try broader address-only search
             results = _brave_get(f'"{address}" real estate listing beds baths sqft price')
     elif address:
         results = _brave_get(f'"{address}" real estate listing beds baths sqft price')
@@ -272,8 +359,32 @@ def fetch_listing_data(address: str | None, mls: str | None) -> str:
         logger.info("Brave fetch_listing_data: no results for address=%r mls=%r", address, mls)
         return ""
 
-    logger.info("Brave fetch_listing_data: %d results for address=%r mls=%r", len(results), address, mls)
-    return _format_listing_data(results, label="Property Listing Details from Web")
+    logger.info("Brave fetch_listing_data: %d results for address=%r mls=%r",
+                len(results), address, mls)
+
+    snippets_text = _format_listing_data(results, label="Brave Search Snippets")
+
+    # ── Layer 2: Full listing page fetch ──────────────────────────────────────
+    # Try up to 3 result URLs; take the first two that are real listing pages
+    page_texts: list[str] = []
+    for result in results[:5]:
+        if len(page_texts) >= 2:
+            break
+        url = result.get("url", "").strip()
+        if not url or not _is_likely_listing_page(url):
+            continue
+        page_text = _fetch_page_text(url, max_chars=8000)
+        if page_text and len(page_text) > 300:
+            source_label = url.split("/")[2]  # e.g. "www.realtor.ca"
+            page_texts.append(
+                f"=== Full Listing Page: {source_label} ===\n{page_text}"
+            )
+
+    # ── Combine layers ────────────────────────────────────────────────────────
+    parts = [p for p in [snippets_text] + page_texts if p]
+    combined = "\n\n".join(parts)
+    logger.info("fetch_listing_data complete — %d chars total", len(combined))
+    return combined
 
 
 def sanitize_for_filename(address: str) -> str:
