@@ -235,6 +235,47 @@ def find_property_address(mls_number: str) -> str:
     return address
 
 
+def fetch_listing_data(address: str | None, mls: str | None) -> str:
+    """
+    Fetch property listing details (beds, baths, sqft, price, parking, etc.)
+    from Brave Search using the address and MLS number we already know.
+
+    Unlike find_property_address_with_data() this skips Pass 1 (MLS→address)
+    because the address was already extracted from the audio transcript.
+
+    Strategy:
+      - address + MLS  → address+MLS combined search (most precise)
+      - address only   → address listing search
+      - MLS only       → MLS listing search
+      - neither        → returns empty string
+
+    Returns:
+        Formatted listing data text ready for AI consumption, or "" if nothing found.
+    """
+    if not BRAVE_API_KEY:
+        logger.warning("BRAVE_API_KEY not set — skipping property detail lookup.")
+        return ""
+
+    results: list[dict] = []
+
+    if address and mls:
+        results = _brave_search_by_address(address, mls)
+        if not results:
+            # Fallback: try broader address-only search
+            results = _brave_get(f'"{address}" real estate listing beds baths sqft price')
+    elif address:
+        results = _brave_get(f'"{address}" real estate listing beds baths sqft price')
+    elif mls:
+        results = _brave_search_by_mls(mls)
+
+    if not results:
+        logger.info("Brave fetch_listing_data: no results for address=%r mls=%r", address, mls)
+        return ""
+
+    logger.info("Brave fetch_listing_data: %d results for address=%r mls=%r", len(results), address, mls)
+    return _format_listing_data(results, label="Property Listing Details from Web")
+
+
 def sanitize_for_filename(address: str) -> str:
     """
     Convert an address string into a safe filename stem.
