@@ -43,9 +43,10 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, TEMP_DIR, TELEGRAM_MAX_FILE_MB, GOOGLE_API_KEY
+from config import TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, TEMP_DIR, TELEGRAM_MAX_FILE_MB, GOOGLE_API_KEY, BRAVE_API_KEY
 from processor import convert_to_mp3, trim_audio_to_seconds, transcribe_audio, get_audio_duration_secs
 from analyzer import extract_address_and_mls, build_safe_filename
+from search import fetch_listing_data
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -236,6 +237,25 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         safe_name    = build_safe_filename(address, mls)
         logger.info("Extracted → address=%r  mls=%r  safe_name=%r", address, mls, safe_name)
 
+        # ── 5b. Brave Search: fetch property listing details ──────────────────
+        listing_data = ""
+        if BRAVE_API_KEY and (address or mls):
+            await message.reply_text(
+                "🌐 <b>Looking up property details on Brave Search...</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            loop = asyncio.get_running_loop()
+            try:
+                listing_data = await loop.run_in_executor(
+                    None, lambda: fetch_listing_data(address, mls)
+                )
+                if listing_data:
+                    logger.info("Brave listing data retrieved (%d chars)", len(listing_data))
+                else:
+                    logger.info("Brave returned no listing data for this property")
+            except Exception as brave_err:
+                logger.warning("Brave search error (non-fatal): %s", brave_err)
+
         # ── 6. Rename full MP3 ────────────────────────────────────────────────
         audio_filename = f"{safe_name}.mp3"
         named_mp3      = os.path.join(TEMP_DIR, audio_filename)
@@ -250,6 +270,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "safe_name":      safe_name,
             "audio_filename": audio_filename,
             "mp3_path":       mp3_path,
+            "listing_data":   listing_data,
         }
 
         await message.reply_text(
@@ -312,8 +333,12 @@ async def send_long_text(message, header: str, body: str) -> None:
         part += 1
 
 
-async def summarize_with_gemini(transcription: str, duration_mins: float) -> str:
-    """Generate a real-estate walkthrough summary using Gemini (google-genai SDK)."""
+async def summarize_with_gemini(transcription: str, duration_mins: float, listing_data: str = "") -> str:
+    """Generate a real-estate walkthrough summary using Gemini (google-genai SDK).
+
+    If listing_data is provided (from Brave Search), Gemini will include key
+    property specs (beds, baths, sqft, price) at the top of the summary.
+    """
     from google import genai as google_genai
 
     if not GOOGLE_API_KEY:
@@ -321,11 +346,23 @@ async def summarize_with_gemini(transcription: str, duration_mins: float) -> str
 
     client = google_genai.Client(api_key=GOOGLE_API_KEY)
 
+    listing_section = ""
+    if listing_data and listing_data.strip():
+        listing_section = (
+            f"\n\nPROPERTY LISTING DATA FROM WEB (Brave Search):\n"
+            f"{'─' * 40}\n"
+            f"{listing_data}\n"
+            f"{'─' * 40}\n"
+        )
+
     prompt = (
         f"You are summarizing a {duration_mins:.1f}-minute real estate walkthrough recording "
         f"transcribed from mixed Farsi and English speech.\n\n"
-        f"TRANSCRIPTION:\n{transcription}\n\n"
+        f"TRANSCRIPTION:\n{transcription}"
+        f"{listing_section}\n\n"
         f"Write a detailed summary of the property walkthrough. Follow these rules:\n"
+        f"- If PROPERTY LISTING DATA is provided above, start the summary with a concise "
+        f"  'Property Specs' block listing beds, baths, sqft, price, and any other key facts found\n"
         f"- Summarize in the same language(s) as the speaker — Farsi parts in Persian script (فارسی), English parts in English\n"
         f"- Use clear sections/bullet points to organize the key topics\n"
         f"- Cover all main points: property features, rooms, condition, highlights\n"
@@ -374,6 +411,7 @@ async def _deliver_package(
     safe_name      = audio_info["safe_name"]
     audio_filename = audio_info["audio_filename"]
     mp3_path       = audio_info["mp3_path"]
+    listing_data   = audio_info.get("listing_data", "")
     video_filename = f"{safe_name}.mp4"
 
     # ── 1. Deliver video + renamed MP3 ────────────────────────────────────────
@@ -447,7 +485,7 @@ async def _deliver_package(
                     parse_mode=ParseMode.HTML,
                 )
                 try:
-                    summary = await summarize_with_gemini(transcription, duration_mins)
+                    summary = await summarize_with_gemini(transcription, duration_mins, listing_data)
                     await sum_status.delete()
                     header = f"📋 <b>Summary</b> — ⏱ {duration_mins:.1f} min\n{'━' * 28}\n\n"
                     await send_long_text(message, header, summary)
