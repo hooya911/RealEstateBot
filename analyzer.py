@@ -35,7 +35,7 @@ _SYSTEM = (
 )
 
 _PROMPT = """You are reading the first 2 minutes of a real estate walkthrough recording.
-At the start, the agent typically announces the property in English.
+The audio is bilingual Farsi+English; the property address and MLS may appear at the start, middle, OR end of the transcript — read the entire transcript carefully. The agent sometimes speaks the address/MLS in English even when the rest is Farsi.
 
 Extract exactly two things:
 
@@ -44,10 +44,10 @@ Extract exactly two things:
    - Include unit/suite number if mentioned.
    - Do NOT include city, province, or postal code.
 
-2. MLS NUMBER — The listing number (7–9 digits).
+2. MLS NUMBER — Toronto/REALM listing ID: optional letter prefix (C, E, W, N, S, X) + 7–9 digits, e.g. "C12754618", "E5678901", or "12345678".
    - It may be spoken as letters then digits: "MLS one two seven five four six one eight" → 12754618
    - It may be spoken digit by digit: "one two three four five six seven" → 1234567
-   - Strip all spaces, dashes, and letters — return digits only.
+   - Strip spaces and dashes. Preserve any leading letter prefix (C/E/W/N/S/X). Convert Persian digits ۰-۹ to ASCII.
 
 TRANSCRIPT (first 2 minutes):
 ---
