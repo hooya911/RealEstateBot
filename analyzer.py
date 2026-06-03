@@ -115,6 +115,8 @@ def extract_address_and_mls(transcript: str) -> tuple[str | None, str | None]:
 def _parse_response(raw: str) -> tuple[str | None, str | None]:
     """
     Parse the two-line ADDRESS: / MLS: response format.
+    Preserves an optional TRREB letter prefix on the MLS (C/E/W/N/S/X)
+    so e.g. "C12754618" stays "C12754618" instead of being stripped to digits.
     Returns (address, mls) with None for any NOT_FOUND value.
     """
     address: str | None = None
@@ -127,10 +129,17 @@ def _parse_response(raw: str) -> tuple[str | None, str | None]:
             if val and val.upper() != "NOT_FOUND":
                 address = val
         elif line.upper().startswith("MLS:"):
-            val = line.split(":", 1)[1].strip()
-            digits = re.sub(r"\D", "", val)
-            if digits:
-                mls = digits
+            val = line.split(":", 1)[1].strip().upper()
+            if not val or val == "NOT_FOUND":
+                continue
+            # TRREB-style letter prefix immediately followed by 5-12 digits.
+            m = re.match(r"^([CEWNSX])\s*([0-9]{5,12})", val)
+            if m:
+                mls = f"{m.group(1)}{m.group(2)}"
+            else:
+                digits = re.sub(r"\D", "", val)
+                if digits:
+                    mls = digits
 
     return address, mls
 

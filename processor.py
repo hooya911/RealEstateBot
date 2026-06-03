@@ -10,6 +10,7 @@ ffmpeg is available on all platforms and is installed on Railway via nixpacks.to
                           (async, 55-second ffmpeg chunks — no memory limit)
 """
 import os
+import re
 import json
 import math
 import asyncio
@@ -139,6 +140,57 @@ def trim_audio_to_seconds(audio_path: str, seconds: int = 120) -> str:
     return trimmed_path
 
 
+# ── Anti-repetition guard for Chirp 3 ASR hallucinations ──────────────────────
+
+def _collapse_runaway_repeats(text: str, max_repeats: int = 3) -> str:
+    """
+    Collapse consecutive phrase repetitions caused by Chirp 3 ASR hallucinations.
+
+    Chirp 3 occasionally gets stuck in a loop on low-content / silent / noisy
+    audio and emits the same short phrase hundreds of times in a row
+    (e.g. "این چیز، این چیز، این چیز، ...").  This walks the token stream
+    left-to-right; whenever the same n-gram (n = 1..6 tokens) repeats more
+    than `max_repeats` times in a row, only the first `max_repeats` copies
+    are kept and the rest are discarded.
+
+    Also collapses 5+ identical chars in a single token down to 3 (catches
+    single-syllable loops like "آآآآآآآآ").
+
+    Works for any whitespace-separated script (English, Persian/Arabic, etc.).
+    """
+    if not text:
+        return text
+
+    # Char-level guard: collapse 5+ identical chars in a row down to 3.
+    text = re.sub(r"(.)\1{4,}", lambda m: m.group(1) * 3, text)
+
+    tokens = text.split()
+    if len(tokens) < 8:
+        return text
+
+    out: list[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        collapsed = False
+        # Try larger n-grams first so multi-word loops get caught.
+        for size in range(min(6, (n - i) // 2), 0, -1):
+            phrase = tokens[i:i + size]
+            count = 1
+            j = i + size
+            while j + size <= n and tokens[j:j + size] == phrase:
+                count += 1
+                j += size
+            if count > max_repeats:
+                out.extend(phrase * max_repeats)
+                i = j
+                collapsed = True
+                break
+        if not collapsed:
+            out.append(tokens[i])
+            i += 1
+    return " ".join(out)
+
 # ── Step 2: Chirp 3 transcription ─────────────────────────────────────────────
 
 async def transcribe_audio(audio_path: str) -> str:
@@ -242,13 +294,28 @@ async def transcribe_audio(audio_path: str) -> str:
             logger.error("Chunk %d/%d failed: %s", idx + 1, num_chunks, chunk_err)
             continue
 
+        chunk_pieces: list[str] = []
         for res in response.results:
             if not res.alternatives:
                 continue
             text = res.alternatives[0].transcript.strip()
             if text:
-                all_lines.append(text)
+                chunk_pieces.append(text)
+
+        if chunk_pieces:
+            chunk_text = " ".join(chunk_pieces)
+            chunk_text_clean = _collapse_runaway_repeats(chunk_text)
+            if chunk_text != chunk_text_clean:
+                logger.info(
+                    "Chunk %d/%d: collapsed runaway repeats (%d → %d chars)",
+                    idx + 1, num_chunks, len(chunk_text), len(chunk_text_clean),
+                )
+            all_lines.append(chunk_text_clean)
 
         logger.info("Chunk %d/%d done", idx + 1, num_chunks)
 
-    return "\n".join(all_lines) if all_lines else "No speech detected in audio"
+    if not all_lines:
+        return "No speech detected in audio"
+    joined = "\n".join(all_lines)
+    # Final pass catches loops that span chunk boundaries.
+    return _collapse_runaway_repeats(joined)
